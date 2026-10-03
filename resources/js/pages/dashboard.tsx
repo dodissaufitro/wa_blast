@@ -215,12 +215,27 @@ interface ReportData {
     device?: string;
 }
 
+export interface WhatsAppDeviceItem {
+    id: number;
+    name: string;
+    session_id: string;
+    phone: string | null;
+    push_name: string | null;
+    status: 'disconnected' | 'connecting' | 'qr_ready' | 'connected' | 'gateway_offline';
+    is_default: boolean;
+    qrCode?: string | null;
+    pairingCode?: string | null;
+    lastUpdated?: string | null;
+    message?: string;
+}
+
 interface DashboardProps {
     totalContactsCount?: number;
     contactGroups?: { group: string; count: number }[];
     userTemplates?: { id: number; name: string; category: string; content: string }[];
     scheduledCampaigns?: ScheduledCampaignItem[];
     recentContacts?: ContactItem[];
+    whatsappDevices?: WhatsAppDeviceItem[];
 }
 
 export default function Dashboard({
@@ -229,6 +244,7 @@ export default function Dashboard({
     userTemplates = [],
     scheduledCampaigns = [],
     recentContacts = [],
+    whatsappDevices = [],
 }: DashboardProps) {
     const { auth } = usePage<SharedData>().props;
 
@@ -257,7 +273,7 @@ export default function Dashboard({
         const cleanPhone = selectedChatRecipient.phone.replace(/[^0-9]/g, '');
         if (!cleanPhone || cleanPhone.length < 8) return;
 
-        fetch(`http://localhost:3001/api/wa/profile-picture/user_1/${cleanPhone}`)
+        fetch(`/device/profile-picture?phone=${cleanPhone}`)
             .then((res) => res.json())
             .then((data) => {
                 if (isMounted && data?.ok && data?.url) {
@@ -655,11 +671,18 @@ export default function Dashboard({
     const [sendProgress, setSendProgress] = useState(0);
     const [showSuccessAlert, setShowSuccessAlert] = useState(false);
 
+    // Multi-Device WhatsApp State
+    const [devices, setDevices] = useState<WhatsAppDeviceItem[]>(whatsappDevices || []);
+    const [activeTargetDevice, setActiveTargetDevice] = useState<WhatsAppDeviceItem | null>(null);
+    const [isAddDeviceModalOpen, setIsAddDeviceModalOpen] = useState(false);
+    const [newDeviceName, setNewDeviceName] = useState('');
+    const [isCreatingDevice, setIsCreatingDevice] = useState(false);
+
     // QR & Import modal state
     const [isQrModalOpen, setIsQrModalOpen] = useState(false);
     const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
-    // Real WhatsApp Gateway Device State
+    // Real WhatsApp Gateway Device State (kept synced for preview & compat)
     const [deviceState, setDeviceState] = useState<{
         status: 'disconnected' | 'connecting' | 'qr_ready' | 'connected' | 'gateway_offline';
         phone: string | null;
@@ -689,37 +712,49 @@ export default function Dashboard({
     const [isSendingTest, setIsSendingTest] = useState(false);
     const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
-    // Fetch device status
-    const fetchDeviceStatus = async () => {
+    // Fetch all devices status from Laravel & Gateway
+    const fetchDevices = async () => {
         try {
-            const res = await fetch('/device/status', {
+            const res = await fetch('/device/list', {
                 headers: { 'Accept': 'application/json' },
             });
             if (res.ok) {
                 const data = await res.json();
-                setDeviceState({
-                    status: data.status || 'disconnected',
-                    phone: data.phone || null,
-                    pushName: data.pushName || null,
-                    qrCode: data.qrCode || null,
-                    pairingCode: data.pairingCode || null,
-                    lastUpdated: data.lastUpdated,
-                    message: data.message,
-                });
-                if (data.status === 'connected') {
-                    setSelectedDevice('real');
+                if (data.ok && Array.isArray(data.devices)) {
+                    setDevices(data.devices);
+                    setActiveTargetDevice((prev) => {
+                        if (!prev) return data.devices[0] || null;
+                        return data.devices.find((d: WhatsAppDeviceItem) => d.id === prev.id) || prev;
+                    });
+                    const primary = data.devices.find((d: WhatsAppDeviceItem) => d.status === 'connected') || data.devices[0];
+                    if (primary) {
+                        setDeviceState({
+                            status: primary.status,
+                            phone: primary.phone,
+                            pushName: primary.push_name,
+                            qrCode: primary.qrCode || null,
+                            pairingCode: primary.pairingCode || null,
+                        });
+                    }
                 }
             }
         } catch (err) {
-            console.error('Error fetching device status:', err);
+            console.error('Error fetching devices:', err);
         }
     };
 
-    // Request connect / generate QR code
-    const handleConnectDevice = async () => {
+    // Open QR / Pairing connect modal for specific device
+    const handleOpenConnect = (dev: WhatsAppDeviceItem) => {
+        setActiveTargetDevice(dev);
+        setIsQrModalOpen(true);
+        handleConnectSpecificDevice(dev);
+    };
+
+    // Connect specific device
+    const handleConnectSpecificDevice = async (dev: WhatsAppDeviceItem) => {
         setIsConnecting(true);
         try {
-            const res = await fetch('/device/connect', {
+            const res = await fetch(`/device/${dev.id}/connect`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -735,6 +770,30 @@ export default function Dashboard({
                     phone: data.phone,
                     pairingCode: data.pairingCode,
                 }));
+                setDevices((prev) =>
+                    prev.map((d) =>
+                        d.id === dev.id
+                            ? {
+                                  ...d,
+                                  status: data.status,
+                                  qrCode: data.qrCode || d.qrCode,
+                                  phone: data.phone || d.phone,
+                                  pairingCode: data.pairingCode || d.pairingCode,
+                              }
+                            : d
+                    )
+                );
+                setActiveTargetDevice((prev) =>
+                    prev && prev.id === dev.id
+                        ? {
+                              ...prev,
+                              status: data.status,
+                              qrCode: data.qrCode || prev.qrCode,
+                              phone: data.phone || prev.phone,
+                              pairingCode: data.pairingCode || prev.pairingCode,
+                          }
+                        : prev
+                );
             }
         } catch (err) {
             console.error('Error requesting connect:', err);
@@ -743,12 +802,15 @@ export default function Dashboard({
         }
     };
 
-    // Request pairing code with phone number
+    // Request pairing code for active target device
     const handleRequestPairingCode = async () => {
         if (!pairingInputPhone.trim()) return;
+        const target = activeTargetDevice || devices[0];
+        if (!target) return;
+
         setIsRequestingPairing(true);
         try {
-            const res = await fetch('/device/pairing-code', {
+            const res = await fetch(`/device/${target.id}/pairing-code`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -763,6 +825,16 @@ export default function Dashboard({
                     pairingCode: data.pairingCode,
                     status: data.status,
                 }));
+                setDevices((prev) =>
+                    prev.map((d) =>
+                        d.id === target.id
+                            ? { ...d, pairingCode: data.pairingCode, status: data.status }
+                            : d
+                    )
+                );
+                setActiveTargetDevice((prev) =>
+                    prev ? { ...prev, pairingCode: data.pairingCode, status: data.status } : null
+                );
             } else {
                 alert(data.error || 'Gagal meminta kode pairing. Pastikan nomor diawali 08 atau 628.');
             }
@@ -773,19 +845,31 @@ export default function Dashboard({
         }
     };
 
-    // Disconnect WhatsApp session
-    const handleDisconnect = async () => {
-        if (!confirm('Apakah Anda yakin ingin memutuskan koneksi WhatsApp ini? Session akan dihapus dan perlu di-scan ulang.')) {
+    // Disconnect specific device
+    const handleDisconnectSpecificDevice = async (dev: WhatsAppDeviceItem) => {
+        if (!confirm(`Apakah Anda yakin ingin memutuskan koneksi WhatsApp "${dev.name}"? Session akan dihapus dan perlu di-scan ulang.`)) {
             return;
         }
         setIsDisconnecting(true);
         try {
-            const res = await fetch('/device/disconnect', {
+            const res = await fetch(`/device/${dev.id}/disconnect`, {
                 method: 'POST',
                 headers: { 'Accept': 'application/json' },
             });
             const data = await res.json();
             if (data.ok) {
+                setDevices((prev) =>
+                    prev.map((d) =>
+                        d.id === dev.id
+                            ? { ...d, status: 'disconnected', phone: null, push_name: null, qrCode: null, pairingCode: null }
+                            : d
+                    )
+                );
+                if (activeTargetDevice?.id === dev.id) {
+                    setActiveTargetDevice((prev) =>
+                        prev ? { ...prev, status: 'disconnected', phone: null, push_name: null, qrCode: null, pairingCode: null } : null
+                    );
+                }
                 setDeviceState({
                     status: 'disconnected',
                     phone: null,
@@ -801,11 +885,63 @@ export default function Dashboard({
         }
     };
 
+    // Delete a device slot
+    const handleDeleteDevice = async (dev: WhatsAppDeviceItem) => {
+        if (!confirm(`Hapus slot perangkat "${dev.name}"? Koneksi akan diputus dan data sesi dibersihkan.`)) {
+            return;
+        }
+        try {
+            const res = await fetch(`/device/${dev.id}`, {
+                method: 'DELETE',
+                headers: { 'Accept': 'application/json' },
+            });
+            const data = await res.json();
+            if (data.ok) {
+                setDevices((prev) => prev.filter((d) => d.id !== dev.id));
+                if (activeTargetDevice?.id === dev.id) {
+                    setActiveTargetDevice(null);
+                    setIsQrModalOpen(false);
+                }
+            }
+        } catch (err) {
+            console.error('Error deleting device:', err);
+        }
+    };
+
+    // Create a new WhatsApp device slot
+    const handleCreateDevice = async () => {
+        if (!newDeviceName.trim()) return;
+        setIsCreatingDevice(true);
+        try {
+            const res = await fetch('/device/create', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                },
+                body: JSON.stringify({ name: newDeviceName.trim() }),
+            });
+            const data = await res.json();
+            if (data.ok && data.device) {
+                const newDev = data.device;
+                setDevices((prev) => [...prev, newDev]);
+                setIsAddDeviceModalOpen(false);
+                setNewDeviceName('');
+                handleOpenConnect(newDev);
+            }
+        } catch (err) {
+            console.error('Error creating device:', err);
+        } finally {
+            setIsCreatingDevice(false);
+        }
+    };
+
     // Send Test Message
     const handleSendTestMessage = async () => {
         if (!testPhone.trim() || !testMessage.trim()) return;
         setIsSendingTest(true);
         setTestResult(null);
+        const target = activeTargetDevice || devices.find((d) => d.status === 'connected') || devices[0];
         try {
             const res = await fetch('/device/send-message', {
                 method: 'POST',
@@ -816,13 +952,14 @@ export default function Dashboard({
                 body: JSON.stringify({
                     phone: testPhone,
                     message: testMessage,
+                    device_id: target?.id,
                 }),
             });
             const data = await res.json();
             if (data.ok) {
                 setTestResult({
                     ok: true,
-                    message: `Pesan sukses terkirim ke +${data.to || testPhone}! (Message ID: ${data.messageId})`,
+                    message: `Pesan sukses terkirim via ${target?.name || 'WA'} ke +${data.to || testPhone}! (ID: ${data.messageId})`,
                 });
             } else {
                 setTestResult({
@@ -840,26 +977,68 @@ export default function Dashboard({
         }
     };
 
-    // Check device status on page load
+    // Check devices on page load
     useEffect(() => {
-        fetchDeviceStatus();
+        fetchDevices();
     }, []);
 
     // Polling when QR modal is open
     useEffect(() => {
         let interval: NodeJS.Timeout | null = null;
-        if (isQrModalOpen) {
-            if (deviceState.status !== 'connected' && !deviceState.qrCode) {
-                handleConnectDevice();
-            }
-            interval = setInterval(() => {
-                fetchDeviceStatus();
+        if (isQrModalOpen && activeTargetDevice) {
+            const targetId = activeTargetDevice.id;
+            interval = setInterval(async () => {
+                try {
+                    const res = await fetch(`/device/${targetId}/status`, {
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.status) {
+                            setDevices((prev) =>
+                                prev.map((d) =>
+                                    d.id === targetId
+                                        ? {
+                                              ...d,
+                                              status: data.status,
+                                              phone: data.phone || d.phone,
+                                              push_name: data.pushName || d.push_name,
+                                              qrCode: data.qrCode || d.qrCode,
+                                              pairingCode: data.pairingCode || d.pairingCode,
+                                          }
+                                        : d
+                                )
+                            );
+                            setActiveTargetDevice((prev) =>
+                                prev && prev.id === targetId
+                                    ? {
+                                          ...prev,
+                                          status: data.status,
+                                          phone: data.phone || prev.phone,
+                                          push_name: data.pushName || prev.push_name,
+                                          qrCode: data.qrCode || prev.qrCode,
+                                          pairingCode: data.pairingCode || prev.pairingCode,
+                                      }
+                                    : prev
+                            );
+                            setDeviceState({
+                                status: data.status,
+                                phone: data.phone || null,
+                                pushName: data.pushName || null,
+                                qrCode: data.qrCode || null,
+                                pairingCode: data.pairingCode || null,
+                            });
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Status poll error:', e);
+                }
             }, 2500);
         }
         return () => {
             if (interval) clearInterval(interval);
         };
-    }, [isQrModalOpen, deviceState.status, deviceState.qrCode]);
+    }, [isQrModalOpen, activeTargetDevice?.id, activeTargetDevice?.status]);
 
     // Insert dynamic tag
     const insertTag = (tag: string) => {
@@ -911,9 +1090,14 @@ export default function Dashboard({
             return;
         }
 
-        if (deviceState.status !== 'connected') {
-            alert('⚠️ WhatsApp Anda belum terhubung! Silakan klik "Scan QR Device" untuk menghubungkan WhatsApp terlebih dahulu.');
-            setIsQrModalOpen(true);
+        const connectedDevices = devices.filter((d) => d.status === 'connected');
+        if (connectedDevices.length === 0) {
+            alert('⚠️ Belum ada akun WhatsApp yang terhubung! Silakan klik "Hubungkan Nomor Baru" atau scan QR perangkat Anda terlebih dahulu.');
+            if (devices.length > 0) {
+                handleOpenConnect(devices[0]);
+            } else {
+                setIsAddDeviceModalOpen(true);
+            }
             return;
         }
 
@@ -945,7 +1129,10 @@ export default function Dashboard({
             }
 
             const targetLabel = targetAudience === 'all' ? 'Semua Kontak' : `Kelompok ${targetAudience}`;
-            const confirmMsg = `Kirim WhatsApp Blast sekarang ke ${recipients.length} kontak (${targetLabel}) dengan delay ${delaySeconds} - ${delaySeconds + 3} detik?`;
+            const devInfo = selectedDevice === 'rotation'
+                ? `Rotasi Otomatis (${connectedDevices.length} Nomor WA Aktif)`
+                : (connectedDevices.find((d) => String(d.id) === selectedDevice)?.name || 'WhatsApp');
+            const confirmMsg = `Kirim WhatsApp Blast sekarang ke ${recipients.length} kontak (${targetLabel})\nMenggunakan: ${devInfo}\nDengan delay ${delaySeconds} - ${delaySeconds + 3} detik?`;
             if (!confirm(confirmMsg)) {
                 setIsSending(false);
                 setSendProgress(0);
@@ -966,7 +1153,11 @@ export default function Dashboard({
                 const contact = recipients[i];
                 const personalizedMsg = personalizeMessage(messageText, contact);
 
-                setBlastStatusText(`Mengirim ke ${contact.name} (+${contact.phone}) [${i + 1}/${recipients.length}]...`);
+                const targetDev = selectedDevice === 'rotation'
+                    ? connectedDevices[i % connectedDevices.length]
+                    : connectedDevices.find((d) => String(d.id) === selectedDevice) || connectedDevices[0];
+
+                setBlastStatusText(`Mengirim ke ${contact.name} via ${targetDev?.name || 'WA'} (+${contact.phone}) [${i + 1}/${recipients.length}]...`);
                 setBlastStats({
                     total: recipients.length,
                     sent: sentCount,
@@ -985,6 +1176,7 @@ export default function Dashboard({
                         body: JSON.stringify({
                             phone: contact.phone,
                             message: personalizedMsg,
+                            device_id: targetDev?.id,
                         }),
                     });
                     const sendData = await sendRes.json();
@@ -1013,10 +1205,16 @@ export default function Dashboard({
                 if (i < recipients.length - 1) {
                     const jitter = Math.floor(Math.random() * 3);
                     const waitTime = Math.max(1, delaySeconds + jitter);
-                    setBlastStatusText(`Pesan ke-${i + 1} berhasil terkirim. Jeda anti-banned (${waitTime} detik)...`);
+                    setBlastStatusText(`Pesan ke-${i + 1} berhasil terkirim via ${targetDev?.name || 'WA'}. Jeda anti-banned (${waitTime} detik)...`);
                     await new Promise((resolve) => setTimeout(resolve, waitTime * 1000));
                 }
             }
+
+            const usedDeviceLabel = selectedDevice === 'rotation'
+                ? `Rotasi (${connectedDevices.length} WA)`
+                : (connectedDevices.find((d) => String(d.id) === selectedDevice)?.name
+                    ? `${connectedDevices.find((d) => String(d.id) === selectedDevice)?.name} (+${connectedDevices.find((d) => String(d.id) === selectedDevice)?.phone || ''})`
+                    : (deviceState.phone ? `+${deviceState.phone}` : 'WhatsApp Anda'));
 
             // Save campaign execution record to DB
             try {
@@ -1034,7 +1232,7 @@ export default function Dashboard({
                         sent_count: sentCount,
                         failed_count: failedCount,
                         message: messageText,
-                        device: deviceState.phone ? `+${deviceState.phone}` : 'WhatsApp Anda',
+                        device: usedDeviceLabel,
                         status: 'completed',
                     }),
                 });
@@ -1312,18 +1510,30 @@ export default function Dashboard({
                                         onChange={(e) => setSelectedDevice(e.target.value)}
                                         className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs shadow-xs focus:outline-hidden focus:ring-1 focus:ring-emerald-500"
                                     >
-                                        {deviceState.status === 'connected' ? (
-                                            <option value="real">
-                                                🟢 WhatsApp Anda (+{deviceState.phone}) - AKTIF
-                                            </option>
-                                        ) : (
-                                            <option value="unconnected">
-                                                ⚠️ WhatsApp Anda (Belum Terhubung - Klik Scan QR)
+                                        {devices.filter((d) => d.status === 'connected').length > 1 && (
+                                            <option value="rotation">
+                                                🔀 Rotasi Otomatis ({devices.filter((d) => d.status === 'connected').length} WhatsApp Bergantian - Anti-Banned)
                                             </option>
                                         )}
-                                        <option value="dev-1">🟢 CS Utama (+62 812-8899-0011)</option>
-                                        <option value="dev-2">🟢 Sales Marketing (+62 858-4455-6677)</option>
-                                        <option value="dev-3">🟢 Notifikasi (+62 877-2233-4455)</option>
+                                        {devices
+                                            .filter((d) => d.status === 'connected')
+                                            .map((dev) => (
+                                                <option key={dev.id} value={String(dev.id)}>
+                                                    🟢 {dev.name} (+{dev.phone}) - AKTIF
+                                                </option>
+                                            ))}
+                                        {devices
+                                            .filter((d) => d.status !== 'connected')
+                                            .map((dev) => (
+                                                <option key={dev.id} value={String(dev.id)} disabled>
+                                                    ⚠️ {dev.name} (Belum Terhubung - Klik Scan QR)
+                                                </option>
+                                            ))}
+                                        {devices.length === 0 && (
+                                            <option value="none" disabled>
+                                                ⚠️ Belum ada WhatsApp yang ditambahkan
+                                            </option>
+                                        )}
                                     </select>
                                 </div>
 
@@ -1726,195 +1936,163 @@ export default function Dashboard({
 
                 {/* 4. WhatsApp Multi-Device Cards */}
                 <div id="devices" className="space-y-3">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
                         <div>
                             <h2 className="text-base font-bold text-foreground flex items-center gap-2">
                                 <Smartphone className="h-4 w-4 text-emerald-500" />
-                                Status Perangkat WhatsApp (Multi-Session)
+                                Status Perangkat WhatsApp (Multi-Device Aktif)
                             </h2>
                             <p className="text-xs text-muted-foreground">
-                                Perangkat aktif yang terhubung via QR WhatsApp Web untuk rotasi pesan.
+                                Hubungkan beberapa nomor WhatsApp sekaligus untuk rotasi pesan cerdas & perlindungan anti-banned.
                             </p>
                         </div>
-                        <Button
-                            onClick={() => setIsQrModalOpen(true)}
-                            size="sm"
-                            className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs cursor-pointer"
-                        >
-                            <Plus className="mr-1 h-3.5 w-3.5" /> Hubungkan Nomor Baru
-                        </Button>
+                        <div className="flex items-center gap-2">
+                            <Button
+                                onClick={fetchDevices}
+                                size="sm"
+                                variant="outline"
+                                className="h-8 text-xs cursor-pointer border-border hover:bg-muted"
+                                title="Perbarui status koneksi semua nomor"
+                            >
+                                <RefreshCw className="mr-1 h-3.5 w-3.5 text-emerald-500" /> Refresh
+                            </Button>
+                            <Button
+                                onClick={() => {
+                                    setNewDeviceName(`WhatsApp ${devices.length + 1}`);
+                                    setIsAddDeviceModalOpen(true);
+                                }}
+                                size="sm"
+                                className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs cursor-pointer h-8"
+                            >
+                                <Plus className="mr-1 h-3.5 w-3.5" /> + Hubungkan Nomor Baru
+                            </Button>
+                        </div>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        {/* 1. Real Device Card (The User's WhatsApp) */}
-                        <Card className={`shadow-xs relative overflow-hidden transition ${
-                            deviceState.status === 'connected'
-                                ? 'border-emerald-500/50 bg-gradient-to-b from-emerald-950/20 to-background ring-1 ring-emerald-500/30'
-                                : deviceState.status === 'qr_ready' || deviceState.status === 'connecting'
-                                ? 'border-amber-500/50 bg-amber-950/10'
-                                : 'border-border/80'
-                        }`}>
-                            <CardContent className="p-4 space-y-3">
-                                <div className="flex items-start justify-between">
-                                    <div className="flex items-center gap-2.5">
-                                        <div className={`h-9 w-9 rounded-lg flex items-center justify-center font-bold ${
-                                            deviceState.status === 'connected'
-                                                ? 'bg-emerald-500 text-white shadow-sm shadow-emerald-500/40'
-                                                : 'bg-muted text-muted-foreground'
-                                        }`}>
-                                            <Smartphone className="h-5 w-5" />
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        {devices.map((dev, idx) => (
+                            <Card
+                                key={dev.id}
+                                className={`shadow-xs relative overflow-hidden transition ${
+                                    dev.status === 'connected'
+                                        ? 'border-emerald-500/50 bg-gradient-to-b from-emerald-950/20 to-background ring-1 ring-emerald-500/30'
+                                        : dev.status === 'qr_ready' || dev.status === 'connecting'
+                                        ? 'border-amber-500/50 bg-amber-950/10'
+                                        : 'border-border/80'
+                                }`}
+                            >
+                                <CardContent className="p-4 space-y-3">
+                                    <div className="flex items-start justify-between">
+                                        <div className="flex items-center gap-2.5">
+                                            <div
+                                                className={`h-9 w-9 rounded-lg flex items-center justify-center font-bold ${
+                                                    dev.status === 'connected'
+                                                        ? 'bg-emerald-500 text-white shadow-sm shadow-emerald-500/40'
+                                                        : 'bg-muted text-muted-foreground'
+                                                }`}
+                                            >
+                                                <Smartphone className="h-5 w-5" />
+                                            </div>
+                                            <div>
+                                                <h3 className="font-semibold text-xs text-foreground flex items-center gap-1.5">
+                                                    {dev.name}
+                                                    {dev.is_default ? (
+                                                        <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 border-emerald-500/40 text-emerald-500">
+                                                            Utama
+                                                        </Badge>
+                                                    ) : (
+                                                        <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 border-slate-500/40 text-muted-foreground">
+                                                            Slot #{idx + 1}
+                                                        </Badge>
+                                                    )}
+                                                </h3>
+                                                <p className="text-xs font-mono text-muted-foreground">
+                                                    {dev.phone ? `+${dev.phone}` : 'Belum Terhubung'}
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-1.5">
+                                            {dev.status === 'connected' && (
+                                                <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-semibold border-emerald-500/30">
+                                                    🟢 Terhubung
+                                                </Badge>
+                                            )}
+                                            {(dev.status === 'qr_ready' || dev.status === 'connecting') && (
+                                                <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 text-[10px] font-semibold border-amber-500/30 animate-pulse">
+                                                    🟡 Siap Scan
+                                                </Badge>
+                                            )}
+                                            {dev.status !== 'connected' && dev.status !== 'qr_ready' && dev.status !== 'connecting' && (
+                                                <Badge variant="outline" className="text-muted-foreground text-[10px]">
+                                                    ⚪ Belum Konek
+                                                </Badge>
+                                            )}
+
+                                            {devices.length > 1 && (
+                                                <button
+                                                    onClick={() => handleDeleteDevice(dev)}
+                                                    className="text-muted-foreground hover:text-rose-500 p-1 rounded-md transition cursor-pointer"
+                                                    title="Hapus Slot WhatsApp"
+                                                >
+                                                    <Trash2 className="h-3.5 w-3.5" />
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-border/60">
+                                        <div>
+                                            <span className="text-muted-foreground">Nama Akun:</span>
+                                            <p className="font-semibold text-foreground truncate">
+                                                {dev.push_name || (dev.status === 'connected' ? 'WhatsApp Terhubung' : '-')}
+                                            </p>
                                         </div>
                                         <div>
-                                            <h3 className="font-semibold text-xs text-foreground flex items-center gap-1.5">
-                                                {deviceState.pushName || 'Nomor WhatsApp Anda'}
-                                                <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 border-emerald-500/40 text-emerald-500">
-                                                    Device Utama
-                                                </Badge>
-                                            </h3>
-                                            <p className="text-xs font-mono text-muted-foreground">
-                                                {deviceState.phone ? `+${deviceState.phone}` : 'Belum Terhubung'}
+                                            <span className="text-muted-foreground">Status Sesi:</span>
+                                            <p className="font-semibold text-foreground">
+                                                {dev.status === 'connected' ? 'Aktif & Siap Blast' : 'Menunggu Scan QR'}
                                             </p>
                                         </div>
                                     </div>
-                                    {deviceState.status === 'connected' && (
-                                        <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-semibold border-emerald-500/30">
-                                            🟢 Terhubung
-                                        </Badge>
-                                    )}
-                                    {(deviceState.status === 'qr_ready' || deviceState.status === 'connecting') && (
-                                        <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 text-[10px] font-semibold border-amber-500/30 animate-pulse">
-                                            🟡 Siap Di-Scan
-                                        </Badge>
-                                    )}
-                                    {deviceState.status === 'disconnected' && (
-                                        <Badge variant="outline" className="text-muted-foreground text-[10px]">
-                                            ⚪ Belum Konek
-                                        </Badge>
-                                    )}
-                                </div>
 
-                                <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-border/60">
-                                    <div>
-                                        <span className="text-muted-foreground">Gateway Protocol:</span>
-                                        <p className="font-semibold text-foreground">Baileys MD v6</p>
-                                    </div>
-                                    <div>
-                                        <span className="text-muted-foreground">Status Sesi:</span>
-                                        <p className="font-semibold text-foreground">
-                                            {deviceState.status === 'connected' ? 'Aktif & Siap Blast' : 'Menunggu Scan QR'}
-                                        </p>
-                                    </div>
-                                </div>
-
-                                <div className="flex items-center justify-between gap-2 pt-1 border-t border-border/60">
-                                    {deviceState.status === 'connected' ? (
-                                        <>
+                                    <div className="flex items-center justify-between gap-2 pt-1 border-t border-border/60">
+                                        {dev.status === 'connected' ? (
+                                            <>
+                                                <Button
+                                                    onClick={() => {
+                                                        setActiveTargetDevice(dev);
+                                                        setIsTestModalOpen(true);
+                                                    }}
+                                                    size="sm"
+                                                    variant="outline"
+                                                    className="h-7 text-xs border-emerald-500/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10 cursor-pointer flex-1"
+                                                >
+                                                    <Send className="mr-1 h-3 w-3" /> Tes Kirim
+                                                </Button>
+                                                <Button
+                                                    onClick={() => handleDisconnectSpecificDevice(dev)}
+                                                    size="sm"
+                                                    variant="ghost"
+                                                    disabled={isDisconnecting}
+                                                    className="h-7 text-xs text-rose-600 hover:bg-rose-500/10 cursor-pointer"
+                                                >
+                                                    <LogOut className="h-3 w-3 mr-1" /> Putuskan
+                                                </Button>
+                                            </>
+                                        ) : (
                                             <Button
-                                                onClick={() => setIsTestModalOpen(true)}
+                                                onClick={() => handleOpenConnect(dev)}
                                                 size="sm"
-                                                variant="outline"
-                                                className="h-7 text-xs border-emerald-500/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10 cursor-pointer flex-1"
+                                                className="w-full h-8 text-xs bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer"
                                             >
-                                                <Send className="mr-1 h-3 w-3" /> Tes Kirim Pesan
+                                                <QrCode className="mr-1.5 h-3.5 w-3.5" /> Scan QR / Pairing
                                             </Button>
-                                            <Button
-                                                onClick={handleDisconnect}
-                                                size="sm"
-                                                variant="ghost"
-                                                disabled={isDisconnecting}
-                                                className="h-7 text-xs text-rose-600 hover:bg-rose-500/10 cursor-pointer"
-                                            >
-                                                <LogOut className="h-3 w-3 mr-1" /> Putuskan
-                                            </Button>
-                                        </>
-                                    ) : (
-                                        <Button
-                                            onClick={() => setIsQrModalOpen(true)}
-                                            size="sm"
-                                            className="w-full h-8 text-xs bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer"
-                                        >
-                                            <QrCode className="mr-1.5 h-3.5 w-3.5" /> Scan QR Sekarang
-                                        </Button>
-                                    )}
-                                </div>
-                            </CardContent>
-                        </Card>
-
-                        {/* 2. CS Rotasi 1 */}
-                        <Card className="border-border/80 shadow-xs relative overflow-hidden">
-                            <CardContent className="p-4 space-y-3">
-                                <div className="flex items-start justify-between">
-                                    <div className="flex items-center gap-2.5">
-                                        <div className="h-9 w-9 rounded-lg bg-teal-500/10 flex items-center justify-center text-teal-600 dark:text-teal-400 font-bold">
-                                            WA
-                                        </div>
-                                        <div>
-                                            <h3 className="font-semibold text-xs text-foreground">Sales & Marketing</h3>
-                                            <p className="text-xs font-mono text-muted-foreground">+62 858-4455-6677</p>
-                                        </div>
+                                        )}
                                     </div>
-                                    <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-semibold border-emerald-500/30">
-                                        🟢 Online (Rotasi)
-                                    </Badge>
-                                </div>
-                                <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-border/60">
-                                    <div>
-                                        <span className="text-muted-foreground">Terkirim Hari Ini:</span>
-                                        <p className="font-semibold text-foreground">2.650 pesan</p>
-                                    </div>
-                                    <div>
-                                        <span className="text-muted-foreground">Session Uptime:</span>
-                                        <p className="font-semibold text-foreground">98.5% (6 hari)</p>
-                                    </div>
-                                </div>
-                                <div className="flex items-center justify-between text-[11px] text-muted-foreground pt-1">
-                                    <span className="flex items-center gap-1">
-                                        <Battery className="h-3.5 w-3.5 text-emerald-500" /> Baterai: 84%
-                                    </span>
-                                    <span className="flex items-center gap-1">
-                                        <Wifi className="h-3.5 w-3.5 text-emerald-500" /> Latensi: 14ms
-                                    </span>
-                                </div>
-                            </CardContent>
-                        </Card>
-
-                        {/* 3. CS Rotasi 2 */}
-                        <Card className="border-border/80 shadow-xs relative overflow-hidden">
-                            <CardContent className="p-4 space-y-3">
-                                <div className="flex items-start justify-between">
-                                    <div className="flex items-center gap-2.5">
-                                        <div className="h-9 w-9 rounded-lg bg-emerald-500/10 flex items-center justify-center text-emerald-600 dark:text-emerald-400 font-bold">
-                                            WA
-                                        </div>
-                                        <div>
-                                            <h3 className="font-semibold text-xs text-foreground">Notifikasi Bot CS</h3>
-                                            <p className="text-xs font-mono text-muted-foreground">+62 877-2233-4455</p>
-                                        </div>
-                                    </div>
-                                    <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-semibold border-emerald-500/30">
-                                        🟢 Online (Rotasi)
-                                    </Badge>
-                                </div>
-                                <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-border/60">
-                                    <div>
-                                        <span className="text-muted-foreground">Terkirim Hari Ini:</span>
-                                        <p className="font-semibold text-foreground">1.560 pesan</p>
-                                    </div>
-                                    <div>
-                                        <span className="text-muted-foreground">Session Uptime:</span>
-                                        <p className="font-semibold text-foreground">99.1% (9 hari)</p>
-                                    </div>
-                                </div>
-                                <div className="flex items-center justify-between text-[11px] text-muted-foreground pt-1">
-                                    <span className="flex items-center gap-1">
-                                        <Battery className="h-3.5 w-3.5 text-emerald-500" /> Baterai: 76%
-                                    </span>
-                                    <span className="flex items-center gap-1">
-                                        <Wifi className="h-3.5 w-3.5 text-emerald-500" /> Latensi: 18ms
-                                    </span>
-                                </div>
-                            </CardContent>
-                        </Card>
+                                </CardContent>
+                            </Card>
+                        ))}
                     </div>
                 </div>
 
@@ -2150,7 +2328,7 @@ export default function Dashboard({
                     <DialogContent className="max-w-md p-6">
                         <DialogHeader>
                             <DialogTitle className="flex items-center gap-2 text-base font-bold text-foreground">
-                                <QrCode className="h-5 w-5 text-emerald-500" /> Hubungkan WhatsApp Anda
+                                <QrCode className="h-5 w-5 text-emerald-500" /> Hubungkan WhatsApp: {activeTargetDevice?.name || 'Perangkat'}
                             </DialogTitle>
                             <DialogDescription className="text-xs text-muted-foreground">
                                 Tautkan nomor WhatsApp Anda dengan aman menggunakan QR Code atau Kode Pairing Multi-Device.
@@ -2158,7 +2336,7 @@ export default function Dashboard({
                         </DialogHeader>
 
                         {/* State 1: Already Connected */}
-                        {deviceState.status === 'connected' ? (
+                        {activeTargetDevice?.status === 'connected' || (deviceState.status === 'connected' && (!activeTargetDevice || activeTargetDevice.id === devices[0]?.id)) ? (
                             <div className="flex flex-col items-center justify-center py-4 space-y-4 text-center animate-in fade-in zoom-in-95">
                                 <div className="relative">
                                     <div className="h-20 w-20 rounded-full bg-emerald-500/15 border-2 border-emerald-500/40 flex items-center justify-center text-emerald-500 shadow-lg shadow-emerald-500/20">
@@ -2174,15 +2352,15 @@ export default function Dashboard({
                                         WhatsApp Berhasil Terhubung! 🎉
                                     </h3>
                                     <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400 font-semibold">
-                                        +{deviceState.phone}
+                                        +{activeTargetDevice?.phone || deviceState.phone}
                                     </p>
                                     <p className="text-xs text-muted-foreground">
-                                        Nama Akun: <b>{deviceState.pushName || 'WhatsApp Anda'}</b>
+                                        Nama Akun: <b>{activeTargetDevice?.push_name || deviceState.pushName || activeTargetDevice?.name || 'WhatsApp Anda'}</b>
                                     </p>
                                 </div>
 
                                 <div className="w-full bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3 text-xs text-emerald-800 dark:text-emerald-200">
-                                    Perangkat Anda siap digunakan untuk kirim pesan blast massal dan auto-reply.
+                                    Perangkat <b>{activeTargetDevice?.name || 'ini'}</b> siap digunakan untuk rotasi kirim pesan blast massal.
                                 </div>
 
                                 <div className="grid grid-cols-2 gap-2 w-full pt-2">
@@ -2196,7 +2374,7 @@ export default function Dashboard({
                                         <Send className="mr-1.5 h-3.5 w-3.5" /> Kirim Pesan Tes
                                     </Button>
                                     <Button
-                                        onClick={handleDisconnect}
+                                        onClick={() => activeTargetDevice && handleDisconnectSpecificDevice(activeTargetDevice)}
                                         disabled={isDisconnecting}
                                         variant="outline"
                                         className="border-rose-500/30 text-rose-600 hover:bg-rose-500/10 text-xs cursor-pointer"
@@ -2245,10 +2423,10 @@ export default function Dashboard({
                                     /* QR CODE VIEW */
                                     <div className="flex flex-col items-center justify-center space-y-4">
                                         <div className="relative p-3 rounded-2xl border-2 border-emerald-500/40 bg-white shadow-xl flex flex-col items-center">
-                                            {deviceState.qrCode ? (
+                                            {activeTargetDevice?.qrCode || deviceState.qrCode ? (
                                                 <div className="relative overflow-hidden rounded-xl bg-white p-2">
                                                     <img
-                                                        src={deviceState.qrCode}
+                                                        src={activeTargetDevice?.qrCode || deviceState.qrCode || ''}
                                                         alt="WhatsApp QR Code"
                                                         className="h-60 w-60 object-contain rounded-lg"
                                                     />
@@ -2276,7 +2454,7 @@ export default function Dashboard({
                                                     Menunggu scan HP...
                                                 </span>
                                                 <button
-                                                    onClick={handleConnectDevice}
+                                                    onClick={() => activeTargetDevice && handleConnectSpecificDevice(activeTargetDevice)}
                                                     disabled={isConnecting}
                                                     className="inline-flex items-center gap-1 hover:text-foreground cursor-pointer underline text-[11px]"
                                                 >
@@ -2332,16 +2510,16 @@ export default function Dashboard({
                                             </p>
                                         </div>
 
-                                        {deviceState.pairingCode ? (
+                                        {(activeTargetDevice?.pairingCode || deviceState.pairingCode) ? (
                                             <div className="p-4 rounded-xl border border-emerald-500/40 bg-emerald-500/10 text-center space-y-2">
                                                 <span className="text-[11px] text-emerald-800 dark:text-emerald-300 font-semibold">
                                                     KODE PAIRING 8-DIGIT ANDA:
                                                 </span>
                                                 <div className="text-2xl font-mono font-bold tracking-widest text-emerald-600 dark:text-emerald-400 bg-background/80 py-2 rounded-lg border border-emerald-500/20 flex items-center justify-center gap-3">
-                                                    <span>{deviceState.pairingCode}</span>
+                                                    <span>{activeTargetDevice?.pairingCode || deviceState.pairingCode}</span>
                                                     <button
                                                         onClick={() => {
-                                                            navigator.clipboard.writeText(deviceState.pairingCode || '');
+                                                            navigator.clipboard.writeText(activeTargetDevice?.pairingCode || deviceState.pairingCode || '');
                                                             setCopiedPairingCode(true);
                                                             setTimeout(() => setCopiedPairingCode(false), 2500);
                                                         }}
@@ -2368,6 +2546,65 @@ export default function Dashboard({
                                 )}
                             </div>
                         )}
+                    </DialogContent>
+                </Dialog>
+
+                {/* Modal: Tambah Slot Nomor WhatsApp Baru */}
+                <Dialog open={isAddDeviceModalOpen} onOpenChange={setIsAddDeviceModalOpen}>
+                    <DialogContent className="max-w-sm p-6">
+                        <DialogHeader>
+                            <DialogTitle className="flex items-center gap-2 text-base font-bold text-foreground">
+                                <Plus className="h-5 w-5 text-emerald-500" /> Tambah Akun WhatsApp
+                            </DialogTitle>
+                            <DialogDescription className="text-xs text-muted-foreground">
+                                Tambahkan nomor WhatsApp baru untuk rotasi blast atau multi-admin CS.
+                            </DialogDescription>
+                        </DialogHeader>
+
+                        <div className="space-y-4 pt-2">
+                            <div className="space-y-1.5">
+                                <Label className="text-xs font-semibold">Nama / Label Akun WhatsApp</Label>
+                                <Input
+                                    value={newDeviceName}
+                                    onChange={(e) => setNewDeviceName(e.target.value)}
+                                    placeholder="Contoh: CS Marketing 2"
+                                    className="h-9 text-xs"
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                            e.preventDefault();
+                                            handleCreateDevice();
+                                        }
+                                    }}
+                                />
+                                <p className="text-[10px] text-muted-foreground">
+                                    Label ini untuk membedakan nomor pengirim saat blast atau penjadwalan pesan.
+                                </p>
+                            </div>
+
+                            <div className="flex justify-end gap-2 pt-2">
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => setIsAddDeviceModalOpen(false)}
+                                    className="text-xs cursor-pointer"
+                                >
+                                    Batal
+                                </Button>
+                                <Button
+                                    size="sm"
+                                    onClick={handleCreateDevice}
+                                    disabled={isCreatingDevice || !newDeviceName.trim()}
+                                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs cursor-pointer"
+                                >
+                                    {isCreatingDevice ? (
+                                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                                    ) : (
+                                        <QrCode className="mr-1.5 h-3.5 w-3.5" />
+                                    )}
+                                    Buat & Scan QR
+                                </Button>
+                            </div>
+                        </div>
                     </DialogContent>
                 </Dialog>
 

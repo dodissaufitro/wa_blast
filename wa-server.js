@@ -2,6 +2,8 @@ import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     Browsers,
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
@@ -9,6 +11,32 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+
+// Load .env file into process.env if present
+try {
+    const envPath = path.resolve('.env');
+    if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        envContent.split(/\r?\n/).forEach((line) => {
+            const trimmed = line.trim();
+            if (trimmed && !trimmed.startsWith('#')) {
+                const eqIdx = trimmed.indexOf('=');
+                if (eqIdx !== -1) {
+                    const key = trimmed.substring(0, eqIdx).trim();
+                    let val = trimmed.substring(eqIdx + 1).trim();
+                    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                        val = val.substring(1, val.length - 1);
+                    }
+                    if (process.env[key] === undefined) {
+                        process.env[key] = val;
+                    }
+                }
+            }
+        });
+    }
+} catch (e) {
+    console.warn('[WA Gateway] Could not load .env:', e.message);
+}
 
 const app = express();
 const PORT = process.env.WA_PORT || 3001;
@@ -54,30 +82,62 @@ function getSessionData(sessionId) {
 /**
  * Initialize / Connect WhatsApp Socket
  */
-async function connectToWhatsApp(sessionId, targetPhone = null) {
+async function connectToWhatsApp(sessionId, targetPhone = null, forceFresh = false) {
     const session = getSessionData(sessionId);
     const sessionPath = path.join(SESSIONS_DIR, sessionId);
 
-    if (session.socket && session.status === 'connected') {
+    if (!forceFresh && session.socket && session.status === 'connected') {
         return session;
     }
 
+    // Clean up any running socket before creating a new one
+    if (session.socket) {
+        try {
+            session.socket.end(undefined);
+        } catch (e) {}
+        session.socket = null;
+    }
+
+    // Only wipe directory when explicitly requested by user (forceFresh = true)
+    // NEVER wipe when forceFresh is false (such as on 515 restartRequired during pairing)!
+    if (forceFresh) {
+        try {
+            if (fs.existsSync(sessionPath)) {
+                fs.rmSync(sessionPath, { recursive: true, force: true });
+            }
+        } catch (e) {
+            console.error('[WA Gateway] Failed to reset session directory:', e.message);
+        }
+    }
+
     session.status = 'connecting';
+    if (forceFresh) {
+        session.qrCode = null;
+        session.pairingCode = null;
+    }
     session.lastUpdated = new Date().toISOString();
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+        const { version } = await fetchLatestBaileysVersion();
         const logger = pino({ level: 'silent' });
 
         const sock = makeWASocket({
-            auth: state,
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, logger),
+            },
             logger,
             printQRInTerminal: false,
-            browser: Browsers.macOS('WABlast Pro'),
+            browser: Browsers.ubuntu('Chrome'),
             generateHighQualityLinkPreview: true,
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 25000,
+            retryRequestDelayMs: 250,
         });
 
         session.socket = sock;
@@ -124,22 +184,36 @@ async function connectToWhatsApp(sessionId, targetPhone = null) {
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403;
+                const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
 
-                console.log(`[WA Gateway] Session ${sessionId} closed. Reason: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+                console.log(`[WA Gateway] Session ${sessionId} closed. Reason: ${statusCode}`);
 
-                if (statusCode === DisconnectReason.loggedOut) {
+                if (isLoggedOut) {
                     session.status = 'disconnected';
                     session.phone = null;
                     session.qrCode = null;
                     session.pairingCode = null;
                     session.socket = null;
                     try {
-                        fs.rmSync(sessionPath, { recursive: true, force: true });
+                        if (fs.existsSync(sessionPath)) {
+                            fs.rmSync(sessionPath, { recursive: true, force: true });
+                        }
                     } catch (e) {}
-                } else {
+                } else if (isRestartRequired) {
+                    // CRITICAL: When scanning QR, WhatsApp sends 515 (restartRequired) to complete key handshake!
+                    // We must reconnect IMMEDIATELY with the same auth state (forceFresh = false)!
+                    console.log(`[WA Gateway] Restart required (code 515) during pairing for ${sessionId}. Reconnecting immediately to finish link...`);
                     session.status = 'connecting';
-                    setTimeout(() => connectToWhatsApp(sessionId), 4000);
+                    setTimeout(() => connectToWhatsApp(sessionId, null, false), 500);
+                } else if (session.status === 'connected' || session.phone) {
+                    // Reconnect for active authenticated sessions
+                    session.status = 'connecting';
+                    setTimeout(() => connectToWhatsApp(sessionId, null, false), 3000);
+                } else {
+                    // Timeout or cancellation before scan
+                    session.status = 'disconnected';
+                    session.socket = null;
                 }
             }
         });
@@ -183,11 +257,19 @@ async function autoRestoreSavedSessions() {
             if (entry.isDirectory()) {
                 const credsPath = path.join(SESSIONS_DIR, entry.name, 'creds.json');
                 if (fs.existsSync(credsPath)) {
-                    console.log(`[WA Gateway] Restoring saved session: ${entry.name}...`);
                     try {
-                        await connectToWhatsApp(entry.name);
+                        const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                        if (creds.registered) {
+                            console.log(`[WA Gateway] Restoring saved session: ${entry.name}...`);
+                            await connectToWhatsApp(entry.name);
+                        } else {
+                            // Clean up unregistered stale files
+                            fs.rmSync(path.join(SESSIONS_DIR, entry.name), { recursive: true, force: true });
+                        }
                     } catch (e) {
-                        console.error(`[WA Gateway] Failed to restore session ${entry.name}:`, e.message);
+                        try {
+                            fs.rmSync(path.join(SESSIONS_DIR, entry.name), { recursive: true, force: true });
+                        } catch (err) {}
                     }
                 }
             }
@@ -209,6 +291,28 @@ app.get('/api/wa/health', (req, res) => {
         service: 'WABlast Pro WhatsApp Gateway',
         activeSessions: sessions.size,
         timestamp: new Date().toISOString(),
+    });
+});
+
+/**
+ * Get all active sessions in memory
+ */
+app.get('/api/wa/sessions', (req, res) => {
+    const list = {};
+    for (const [id, session] of sessions.entries()) {
+        list[id] = {
+            id,
+            status: session.status,
+            phone: session.phone,
+            pushName: session.pushName,
+            qrCode: session.qrCode,
+            pairingCode: session.pairingCode,
+            lastUpdated: session.lastUpdated,
+        };
+    }
+    res.json({
+        ok: true,
+        sessions: list,
     });
 });
 
@@ -236,10 +340,18 @@ app.get('/api/wa/status/:sessionId', (req, res) => {
  */
 app.post('/api/wa/connect/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
-    const { phone } = req.body || {};
+    const { phone, forceFresh } = req.body || {};
 
     try {
-        const session = await connectToWhatsApp(sessionId, phone);
+        const session = await connectToWhatsApp(sessionId, phone, forceFresh !== undefined ? forceFresh : true);
+
+        // Wait up to 3500ms for QR code or connected status so response contains qrCode directly
+        let waited = 0;
+        while (!session.qrCode && session.status !== 'connected' && waited < 3500) {
+            await new Promise((r) => setTimeout(r, 200));
+            waited += 200;
+        }
+
         res.json({
             ok: true,
             sessionId: session.id,
@@ -254,6 +366,25 @@ app.post('/api/wa/connect/:sessionId', async (req, res) => {
 });
 
 /**
+ * Request Pairing Code with clean session reset if switching number
+ */
+async function requestPairingCodeForSession(sessionId, targetPhone) {
+    const session = await connectToWhatsApp(sessionId, targetPhone, true);
+
+    let waited = 0;
+    while (!session.pairingCode && session.status !== 'connected' && waited < 7500) {
+        await new Promise((r) => setTimeout(r, 250));
+        waited += 250;
+    }
+
+    if (!session.pairingCode && session.status !== 'connected') {
+        throw new Error('Gagal meminta kode pairing dari WhatsApp. Silakan periksa format nomor dan coba lagi.');
+    }
+
+    return session.pairingCode;
+}
+
+/**
  * Request Pairing Code by Phone Number
  */
 app.post('/api/wa/pairing-code/:sessionId', async (req, res) => {
@@ -265,15 +396,16 @@ app.post('/api/wa/pairing-code/:sessionId', async (req, res) => {
     }
 
     try {
-        const session = await connectToWhatsApp(sessionId, phone);
+        const code = await requestPairingCodeForSession(sessionId, phone);
         res.json({
             ok: true,
-            sessionId: session.id,
-            status: session.status,
-            pairingCode: session.pairingCode,
+            sessionId,
+            status: 'pairing_ready',
+            pairingCode: code,
         });
     } catch (err) {
-        res.status(500).json({ ok: false, error: err.message });
+        console.error('[WA Gateway] Pairing code error:', err.message);
+        res.status(500).json({ ok: false, error: 'Gagal meminta kode pairing: ' + err.message });
     }
 });
 
@@ -300,6 +432,32 @@ app.post('/api/wa/disconnect/:sessionId', async (req, res) => {
         }
 
         res.json({ ok: true, message: 'Session disconnected successfully' });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+/**
+ * Remove session entirely
+ */
+app.delete('/api/wa/session/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    try {
+        if (sessions.has(sessionId)) {
+            const session = sessions.get(sessionId);
+            if (session.socket) {
+                try {
+                    await session.socket.logout();
+                } catch (e) {}
+                session.socket = null;
+            }
+            sessions.delete(sessionId);
+        }
+        const sessionPath = path.join(SESSIONS_DIR, sessionId);
+        if (fs.existsSync(sessionPath)) {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+        }
+        res.json({ ok: true, message: 'Session removed' });
     } catch (err) {
         res.status(500).json({ ok: false, error: err.message });
     }

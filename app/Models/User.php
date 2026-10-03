@@ -70,4 +70,12 @@ class User extends Authenticatable
     {
         return $this->hasMany(ScheduledCampaign::class);
     }
+
+    /**
+     * WhatsApp Devices belonging to this user.
+     */
+    public function devices(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(WhatsAppDevice::class);
+    }
 }

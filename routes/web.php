@@ -37,12 +37,24 @@ Route::middleware(['auth'])->group(function () {
             ->take(25)
             ->get(['id', 'name', 'phone', 'group']);
 
+        $devices = $user->devices()->orderBy('id')->get();
+        if ($devices->isEmpty()) {
+            $defaultDev = $user->devices()->create([
+                'name' => 'WhatsApp 1 (Utama)',
+                'session_id' => 'user_' . $user->id,
+                'is_default' => true,
+                'status' => 'disconnected',
+            ]);
+            $devices = collect([$defaultDev]);
+        }
+
         return Inertia::render('dashboard', [
             'totalContactsCount' => $user->contacts()->count(),
             'contactGroups' => $contactGroups,
             'userTemplates' => $templates,
             'scheduledCampaigns' => $scheduledCampaigns,
             'recentContacts' => $recentContacts,
+            'whatsappDevices' => $devices,
         ]);
     })->name('dashboard');
 
@@ -59,13 +71,26 @@ Route::middleware(['auth'])->group(function () {
     Route::post('campaigns/record-instant', [ScheduledCampaignController::class, 'recordInstant'])->name('campaigns.record-instant');
     Route::resource('scheduled-campaigns', ScheduledCampaignController::class)->only(['store', 'destroy']);
 
-    // WhatsApp Real Device Connection Routes
+    // WhatsApp Multi-Device Connection Routes
     Route::prefix('device')->name('device.')->group(function () {
+        Route::get('list', [DeviceController::class, 'index'])->name('list');
+        Route::post('create', [DeviceController::class, 'store'])->name('store');
+        Route::get('profile-picture', [DeviceController::class, 'profilePicture'])->name('profile-picture');
+        Route::post('send-message', [DeviceController::class, 'sendMessage'])->name('send-message');
+
+        // Parameterized routes for specific devices
+        Route::get('{id}/status', [DeviceController::class, 'status'])->name('device-status');
+        Route::post('{id}/connect', [DeviceController::class, 'connect'])->name('device-connect');
+        Route::post('{id}/pairing-code', [DeviceController::class, 'pairingCode'])->name('device-pairing');
+        Route::post('{id}/disconnect', [DeviceController::class, 'disconnect'])->name('device-disconnect');
+        Route::put('{id}', [DeviceController::class, 'update'])->name('device-update');
+        Route::delete('{id}', [DeviceController::class, 'destroy'])->name('device-destroy');
+
+        // Fallback default device routes (backward compatibility)
         Route::get('status', [DeviceController::class, 'status'])->name('status');
         Route::post('connect', [DeviceController::class, 'connect'])->name('connect');
         Route::post('pairing-code', [DeviceController::class, 'pairingCode'])->name('pairing-code');
         Route::post('disconnect', [DeviceController::class, 'disconnect'])->name('disconnect');
-        Route::post('send-message', [DeviceController::class, 'sendMessage'])->name('send-message');
     });
 });
 
